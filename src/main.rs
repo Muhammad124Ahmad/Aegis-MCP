@@ -1,59 +1,88 @@
 use axum::{
+    extract::State,
     routing::post,
     Router,
     Json,
 };
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Instant;
+
+// --- NEW: Cryptography Imports ---
+use ed25519_dalek::{Signer, SigningKey};
+use rand::rngs::OsRng;
+use sha2::{Sha256, Digest};
+
+// 1. Define our Application State
+// This struct holds our private signing key in memory so every request can use it.
+// We wrap it in an `Arc` (Atomic Reference Counted) so it can be safely shared across Tokio's threads.
+struct AppState {
+    signing_key: SigningKey,
+}
 
 #[tokio::main]
 async fn main() {
-    // Define our router
-    let app = Router::new()
-        .route("/mcp", post(intercept_mcp_request));
+    // 2. Generate a secure, random Ed25519 Keypair when AEGIS boots up
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    println!("🔑 AEGIS Cryptographic Key Generated.");
 
-    // Bind the TCP listener
+    // Create our shared state
+    let shared_state = Arc::new(AppState { signing_key });
+
+    // 3. Define our router and pass the state to it
+    let app = Router::new()
+        .route("/mcp", post(intercept_mcp_request))
+        .with_state(shared_state); // <-- Injecting the key into the router!
+
+    // Bind and start the server
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await.unwrap();
     println!("🛡️ AEGIS-MCP Proxy running on http://127.0.0.1:8080");
 
-    // Start the server
     axum::serve(listener, app).await.unwrap();
 }
 
-// The Interceptor Function
-async fn intercept_mcp_request(Json(payload): Json<Value>) -> Json<Value> {
-    // 1. Start the stopwatch
+// 4. The Interceptor Function (Now with `State`)
+async fn intercept_mcp_request(
+    State(state): State<Arc<AppState>>, // <-- Extracting the key from Axum
+    Json(payload): Json<Value>,
+) -> Json<Value> {
     let start_time = Instant::now();
     println!("🚨 Intercepted MCP Payload: {:#?}", payload);
+
+    // --- NEW: Cryptographic Signing Logic ---
     
-    // --- NEW: Forwarding Logic ---
-    // 2. Create our HTTP client
+    // Step A: Convert the JSON payload into a plain string so we can hash it
+    let payload_string = serde_json::to_string(&payload).unwrap();
+    
+    // Step B: Create a SHA-256 Hash (Fingerprint) of the payload
+    let mut hasher = Sha256::new();
+    hasher.update(payload_string.as_bytes());
+    let payload_hash = hasher.finalize();
+    
+    // Step C: Sign the hash using our Ed25519 Private Key
+    let signature = state.signing_key.sign(&payload_hash);
+    
+    println!("🔐 SHA-256 Hash: {:x}", payload_hash);
+    println!("✍️  Ed25519 Signature: {}", hex::encode(signature.to_bytes()));
+    // ----------------------------------------
+
+    // Forwarding Logic (Same as before)
     let client = reqwest::Client::new();
-    
-    // 3. Define our target (Our "Fake" MCP Server for testing)
     let target_url = "https://httpbin.org/post";
-    println!("➡️ Forwarding request to: {}", target_url);
     
-    // 4. Send the payload and await the response
     let response = client
         .post(target_url)
         .json(&payload)
         .send()
         .await
-        .expect("Failed to send request to target server") // Basic error handling
-        .json::<Value>() // Parse the response back into JSON
+        .expect("Failed to send request")
+        .json::<Value>()
         .await
-        .expect("Failed to parse response JSON");
-    // ------------------------------
+        .expect("Failed to parse response");
 
-    // 5. Stop the stopwatch
     let duration = start_time.elapsed();
+    println!("⏱️ Total Time (Including Crypto & Network): {:?}", duration);
     
-    // Note: Because we are making a real network call to the internet (httpbin), 
-    // this time will be much higher (e.g., 200ms+). This is normal network lag, 
-    // NOT AEGIS processing overhead! When we run things locally, it drops back down.
-    println!("⏱️ AEGIS Total Round-Trip Time: {:?}", duration);
-    
-    // 6. Return the response from the destination server back to the user
     Json(response)
 }
